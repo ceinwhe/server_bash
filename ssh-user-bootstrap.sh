@@ -120,19 +120,16 @@ main() {
     trap 'exit 130' INT
     trap 'exit 143' TERM
 
-    # 仅从 authorized_keys 提取已授权公钥, 不复制服务器私钥.
+    # 自动迁移已授权公钥; 独立公钥文件需要确认后才授权给新用户.
     : > "$temporary/keys"
     key_count=0
-    root_home=$(getent passwd root | awk -F: '{print $6}')
-    sources=("$root_home/.ssh/authorized_keys" "$root_home/.ssh/authorized_keys2")
-    if [[ -n ${SUDO_USER:-} && $SUDO_USER != root ]]; then
-        caller_home=$(getent passwd "$SUDO_USER" | awk -F: '{print $6}')
-        if [[ -n $caller_home ]]; then
-            sources+=("$caller_home/.ssh/authorized_keys" "$caller_home/.ssh/authorized_keys2")
+    import_public_keys() {
+        local source=$1 line before=$key_count
+        [[ -f $source && -r $source ]] || { say "无法读取公钥文件:$source"; return 0; }
+        if grep -q -- '-----BEGIN .*PRIVATE KEY-----' "$source"; then
+            say "跳过私钥文件:$source (请提供 .pub 公钥或 authorized_keys)"
+            return 0
         fi
-    fi
-    for source in "${sources[@]}"; do
-        [[ -f $source && -r $source ]] || continue
         while IFS= read -r line || [[ -n $line ]]; do
             line=${line%$'\r'}
             [[ $line =~ ^[[:space:]]*$ || $line =~ ^[[:space:]]*# ]] && continue
@@ -146,7 +143,50 @@ main() {
                 key_count=$((key_count + 1))
             fi
         done < "$source"
+        say "从 $source 新增 $((key_count - before)) 条授权公钥."
+    }
+    root_home=$(getent passwd root | awk -F: '{print $6}')
+    [[ -n $root_home ]] || fail '无法确定 root 的家目录.'
+    key_homes=("$root_home")
+    if [[ -n ${SUDO_USER:-} && $SUDO_USER != root ]]; then
+        caller_home=$(getent passwd "$SUDO_USER" | awk -F: '{print $6}')
+        if [[ -n $caller_home && $caller_home != "$root_home" ]]; then
+            key_homes+=("$caller_home")
+        fi
+    fi
+    for key_home in "${key_homes[@]}"; do
+        say "检查 SSH 公钥目录:$key_home/.ssh"
+        if [[ ! -d $key_home/.ssh ]]; then
+            say '目录不存在.'
+            continue
+        fi
+        found_key_file=0
+        for source in "$key_home/.ssh/authorized_keys" "$key_home/.ssh/authorized_keys2"; do
+            [[ -f $source ]] || continue
+            found_key_file=1
+            import_public_keys "$source"
+        done
+        for source in "$key_home/.ssh/"*.pub; do
+            [[ -f $source ]] || continue
+            found_key_file=1
+            if ask_yes_no "发现公钥文件 $source, 是否授权对应密钥登录新用户"; then
+                import_public_keys "$source"
+            fi
+        done
+        if (( ! found_key_file )); then
+            say '未找到 authorized_keys、authorized_keys2 或 *.pub; 私钥不会被导入.'
+        fi
     done
+    if (( key_count == 0 )); then
+        say '未导入公钥. 这里只能检测服务器上的文件, 无法读取本地电脑的 .ssh.'
+        while :; do
+            ask '请输入服务器上公钥或 authorized_keys 的绝对路径 (回车跳过):'
+            [[ -n $REPLY ]] || break
+            [[ $REPLY == /* ]] || { say '请输入绝对路径.'; continue; }
+            import_public_keys "$REPLY"
+            (( key_count == 0 )) || break
+        done
+    fi
     say "检测到 $key_count 条可用的 SSH 授权公钥."
 
     # 修改 root 登录策略前, 确认新用户至少有一种 SSH 登录方式.
