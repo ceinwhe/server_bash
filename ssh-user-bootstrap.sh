@@ -6,20 +6,25 @@ main() {
     export PATH=/usr/sbin:/usr/bin:/sbin:/bin
     umask 077
 
-    fail() { printf '错误:%s\n' "$*" >&2; exit 1; }
-    say() { printf '%s\n' "$*" >&4; }
+    fail() { printf '[错误] %s\n' "$*" >&2; exit 1; }
+    cancel() { printf '[取消] %s\n' "$*" >&2; exit 1; }
+    say() { printf '[信息] %s\n' "$*" >&4; }
+    warn() { printf '[警告] %s\n' "$*" >&4; }
+    success() { printf '[完成] %s\n' "$*" >&4; }
+    stage() { printf '\n-- %s --\n' "$*" >&4; }
+    detail() { printf '  %s: %s\n' "$1" "$2" >&4; }
     ask() {
-        printf '%s' "$1" >&4
-        IFS= read -r REPLY <&3 || fail '无法从终端读取输入.'
+        printf '[输入] %s' "$1" >&4
+        IFS= read -r REPLY <&3 || fail '无法读取终端输入, 操作已中止.'
     }
     ask_yes_no() {
         while :; do
-            ask "$1 [y/n]:"
+            ask "$1 [y/n]: "
             case $REPLY in
                 y|Y|yes|YES|是) return 0 ;;
                 n|N|no|NO|否) return 1 ;;
             esac
-            say '请输入 y 或 n.'
+            warn '输入无效.请输入 y(是)或 n(否).'
         done
     }
     cleanup() {
@@ -28,49 +33,53 @@ main() {
         if (( result != 0 )); then
             if (( root_locked )); then
                 { printf 'root:'; cat "$temporary/root-password"; } | chpasswd -e \
-                    || printf '紧急:恢复 root 密码失败, 请保留当前会话并手动检查.\n' >&2
+                    || printf '[紧急] root 密码恢复失败.请保留当前会话并手动恢复.\n' >&2
             fi
             if (( ssh_changed )); then
                 cp -a -- "$temporary/sshd_config" "$sshd_config" \
                     && "$sshd" -t \
                     && systemctl reload "$ssh_service" \
-                    || printf '紧急:恢复 SSH 配置失败, 请保留当前会话并手动检查.\n' >&2
+                    || printf '[紧急] SSH 配置恢复失败.请保留当前会话并手动恢复.\n' >&2
             fi
             if (( sudo_created )); then rm -f -- "$sudo_file"; fi
             if (( user_created )); then
                 userdel -r -- "$username" >/dev/null 2>&1 \
-                    || printf '警告:自动删除新用户失败, 请手动检查 %s.\n' "$username" >&2
+                    || printf '[警告] 回滚时未能删除用户 %s, 请手动检查.\n' "$username" >&2
             fi
         fi
         if [[ -n ${temporary:-} && -d $temporary ]]; then rm -rf -- "$temporary"; fi
         # 管道运行没有源文件; 文件运行成功后删除源文件.
         if (( result == 0 )) && [[ -n ${script_file:-} ]]; then
-            rm -f -- "$script_file" || printf '警告:未能删除脚本文件 %s.\n' "$script_file" >&2
+            rm -f -- "$script_file" || printf '[警告] 未能删除脚本文件: %s\n' "$script_file" >&2
         fi
         exit "$result"
     }
 
-    [[ $# -eq 0 ]] || fail '本脚本不接受命令参数, 请按中文提示操作.'
-    [[ $EUID -eq 0 ]] || fail '请以 root 身份运行, 例如 curl -fsSL 地址 | sudo bash.'
-    [[ -r /dev/tty && -w /dev/tty ]] || fail '需要可交互的终端.'
+    [[ $# -eq 0 ]] || fail '本脚本不接受命令行参数, 请按照交互提示配置.'
+    [[ $EUID -eq 0 ]] || fail '权限不足, 请以 root 身份运行或使用 sudo bash.'
+    [[ -r /dev/tty && -w /dev/tty ]] || fail '无法访问交互终端, 请在终端会话中运行.'
     exec 3</dev/tty 4>/dev/tty
+    stage 'SSH 用户初始化'
+    say '配置普通用户, SSH 公钥及 sudo 权限, 并在登录验证通过后限制 root 登录.'
+    stage '1/5 环境检查'
     for tool in useradd userdel getent chpasswd passwd ssh-keygen visudo sudo \
                 install systemctl mktemp cp awk python3 grep readlink; do
-        command -v "$tool" >/dev/null || fail "缺少所需命令:$tool"
+        command -v "$tool" >/dev/null || fail "缺少依赖命令: $tool.请安装后重试."
     done
-    sshd=$(command -v sshd) || fail '未找到 sshd.'
+    sshd=$(command -v sshd) || fail '未找到 sshd, 请安装 OpenSSH Server.'
     sshd_config=/etc/ssh/sshd_config
-    [[ -f $sshd_config && ! -L $sshd_config ]] || fail '未找到常规 SSH 配置文件 /etc/ssh/sshd_config.'
-    "$sshd" -t || fail '现有 SSH 配置检查失败, 请先修复.'
+    [[ -f $sshd_config && ! -L $sshd_config ]] || fail '/etc/ssh/sshd_config 必须存在且为非符号链接的普通文件.'
+    "$sshd" -t || fail '现有 SSH 配置校验失败, 请根据上述诊断修复后重试.'
     ssh_service=
     for service in ssh.service sshd.service; do
         if systemctl is-active --quiet "$service"; then ssh_service=$service; break; fi
     done
-    [[ -n $ssh_service ]] || fail '没有运行中的 systemd SSH 服务.'
+    [[ -n $ssh_service ]] || fail '未检测到运行中的 ssh.service 或 sshd.service.'
     [[ $(systemctl show -p CanReload --value "$ssh_service") == yes ]] \
-        || fail 'SSH 服务不支持重新加载.'
-    [[ -d /etc/sudoers.d && ! -L /etc/sudoers.d ]] || fail '找不到常规的 /etc/sudoers.d 目录.'
-    visudo -c >/dev/null || fail '现有 sudo 配置检查失败, 请先修复.'
+        || fail '当前 SSH 服务不支持 reload, 无法应用配置.'
+    [[ -d /etc/sudoers.d && ! -L /etc/sudoers.d ]] || fail '/etc/sudoers.d 必须存在且不能为符号链接.'
+    visudo -c >/dev/null || fail '现有 sudo 配置校验失败, 请修复后重试.'
+    success "环境检查通过.SSH 服务: $ssh_service"
 
     script_file=
     bash_file=$(readlink -f -- "$BASH")
@@ -84,39 +93,39 @@ main() {
             ;;
     esac
 
-    say '将创建普通用户, 设置密码和 sudo 权限, 然后禁止 root 密码及密钥登录.'
-    say '第一步:填写全部配置. 此阶段只检查环境和准备临时文件, 不修改用户或系统配置.'
+    stage '2/5 配置录入'
+    say '本阶段仅收集配置, 执行检查并准备临时文件; 确认执行前不会修改用户或系统配置.'
     while :; do
-        ask '请输入新用户名:'
+        ask '新用户名: '
         username=$REPLY
         [[ $username =~ ^[a-z_][a-z0-9_-]{0,30}$ && $username != root ]] || {
-            say '用户名只能以小写字母或下划线开头, 后续使用小写字母, 数字, _ 或 -, 最长 31 字符.'
+            warn '用户名须以小写字母或下划线开头, 仅允许小写字母, 数字, 下划线和连字符, 最长 31 个字符; 不能使用 root.'
             continue
         }
-        getent passwd "$username" >/dev/null && { say '该用户已存在, 请换一个用户名.'; continue; }
+        getent passwd "$username" >/dev/null && { warn "用户已存在: $username.请使用其他用户名."; continue; }
         [[ ! -e /home/$username && ! -L /home/$username ]] || {
-            say '同名家目录已存在, 请换一个用户名.'; continue;
+            warn "家目录已存在: /home/$username.请使用其他用户名."; continue;
         }
         break
     done
     while :; do
-        printf '请输入新用户密码:' >&4
-        IFS= read -r -s password <&3 || fail '无法读取密码.'
-        printf '\n请再次输入密码:' >&4
-        IFS= read -r -s confirmation <&3 || fail '无法读取密码确认.'
+        printf '[输入] 登录密码(输入不回显): ' >&4
+        IFS= read -r -s password <&3 || fail '无法读取登录密码, 操作已中止.'
+        printf '\n[输入] 再次输入密码: ' >&4
+        IFS= read -r -s confirmation <&3 || fail '无法读取密码确认输入, 操作已中止.'
         printf '\n' >&4
-        [[ -n $password ]] || { say '密码不能为空.'; continue; }
+        [[ -n $password ]] || { warn '密码不能为空, 请重新输入.'; continue; }
         [[ $password == "$confirmation" ]] && break
-        say '两次密码不一致, 请重新输入.'
+        warn '两次输入的密码不一致, 请重新输入.'
     done
     unset confirmation
     passwordless=0
-    if ask_yes_no '是否允许该用户 sudo 免密'; then passwordless=1; fi
+    if ask_yes_no '是否启用 sudo 免密执行'; then passwordless=1; fi
 
     temporary=$(mktemp -d /run/ssh-user-bootstrap.XXXXXXXX)
     user_created=0 sudo_created=0 ssh_changed=0 root_locked=0
     sudo_file=/etc/sudoers.d/99-ssh-user-bootstrap-$username
-    [[ ! -e $sudo_file && ! -L $sudo_file ]] || fail '同名 sudo 规则已经存在.'
+    [[ ! -e $sudo_file && ! -L $sudo_file ]] || fail "sudo 规则文件已存在: $sudo_file.请检查现有配置."
     trap cleanup EXIT
     trap 'exit 130' INT
     trap 'exit 143' TERM
@@ -125,29 +134,47 @@ main() {
     : > "$temporary/keys"
     key_count=0
     import_public_keys() {
-        local source=$1 line before=$key_count
-        [[ -f $source && -r $source ]] || { say "无法读取公钥文件:$source"; return 0; }
+        local source=$1 confirm=${2:-0} line before=$key_count
+        local -a public_lines=()
+        # ssh-keygen 也接受 known_hosts; 先检查授权公钥的行格式, 避免误导入主机密钥.
+        local flag='(cert-authority|restrict|no-agent-forwarding|no-port-forwarding|no-pty|no-user-rc|no-X11-forwarding|agent-forwarding|port-forwarding|pty|user-rc|X11-forwarding|no-touch-required|verify-required)'
+        local value='(command|environment|expiry-time|from|permitlisten|permitopen|principals|tunnel)=("([^"\\]|\\.)*"|[^[:space:],"]+)'
+        local option="($flag|$value)"
+        local public_pattern="^[[:space:]]*($option(,$option)*[[:space:]]+)?(ssh-|ecdsa-|sk-)[^[:space:]]+[[:space:]]+"
+        [[ -f $source && -r $source ]] || { warn "公钥文件不存在或不可读: $source"; return 0; }
         if grep -q -- '-----BEGIN .*PRIVATE KEY-----' "$source"; then
-            say "跳过私钥文件:$source (请提供 .pub 公钥或 authorized_keys)"
+            say "跳过私钥文件: $source.仅接受公钥, 文件名及后缀不限."
             return 0
         fi
         while IFS= read -r line || [[ -n $line ]]; do
             line=${line%$'\r'}
             [[ $line =~ ^[[:space:]]*$ || $line =~ ^[[:space:]]*# ]] && continue
+            [[ $line =~ $public_pattern ]] || continue
             printf '%s\n' "$line" > "$temporary/one-key"
             if ! ssh-keygen -l -f "$temporary/one-key" >/dev/null 2>&1; then
-                say "跳过无效公钥:$source"
+                warn "公钥校验失败, 已跳过该条记录.来源: $source"
                 continue
             fi
+            public_lines+=("$line")
+        done < "$source"
+        if (( ${#public_lines[@]} == 0 )); then
+            say "已跳过不含有效授权公钥的文件: $source"
+            return 0
+        fi
+        if (( confirm )); then
+            say "识别到公钥文件: $source(${#public_lines[@]} 条有效记录)"
+            ask_yes_no '是否将该文件中的公钥加入新用户授权列表' || return 0
+        fi
+        for line in "${public_lines[@]}"; do
             if ! grep -Fqx -- "$line" "$temporary/keys"; then
                 printf '%s\n' "$line" >> "$temporary/keys"
                 key_count=$((key_count + 1))
             fi
-        done < "$source"
-        say "从 $source 新增 $((key_count - before)) 条授权公钥."
+        done
+        say "待导入列表新增 $((key_count - before)) 条公钥, 重复记录已排除.来源: $source"
     }
     root_home=$(getent passwd root | awk -F: '{print $6}')
-    [[ -n $root_home ]] || fail '无法确定 root 的家目录.'
+    [[ -n $root_home ]] || fail '无法从用户数据库获取 root 家目录.'
     key_homes=("$root_home")
     if [[ -n ${SUDO_USER:-} && $SUDO_USER != root ]]; then
         caller_home=$(getent passwd "$SUDO_USER" | awk -F: '{print $6}')
@@ -156,9 +183,9 @@ main() {
         fi
     fi
     for key_home in "${key_homes[@]}"; do
-        say "检查 SSH 公钥目录:$key_home/.ssh"
+        say "正在扫描公钥目录: $key_home/.ssh"
         if [[ ! -d $key_home/.ssh ]]; then
-            say '目录不存在.'
+            say '目录不存在, 已跳过.'
             continue
         fi
         found_key_file=0
@@ -167,28 +194,28 @@ main() {
             found_key_file=1
             import_public_keys "$source"
         done
-        for source in "$key_home/.ssh/"*.pub; do
+        # 包括无后缀文件和隐藏文件; 不递归扫描子目录.
+        for source in "$key_home/.ssh/"* "$key_home/.ssh/".[!.]* "$key_home/.ssh/"..?*; do
             [[ -f $source ]] || continue
+            case ${source##*/} in authorized_keys|authorized_keys2) continue ;; esac
             found_key_file=1
-            if ask_yes_no "发现公钥文件 $source, 是否授权对应密钥登录新用户"; then
-                import_public_keys "$source"
-            fi
+            import_public_keys "$source" 1
         done
         if (( ! found_key_file )); then
-            say '未找到 authorized_keys、authorized_keys2 或 *.pub; 私钥不会被导入.'
+            say '目录中没有可检查的普通文件.'
         fi
     done
     if (( key_count == 0 )); then
-        say '未导入公钥. 这里只能检测服务器上的文件, 无法读取本地电脑的 .ssh.'
+        warn '待导入公钥列表为空.仅支持读取服务器上的文件, 无法访问本地电脑的 .ssh 目录.'
         while :; do
-            ask '请输入服务器上公钥或 authorized_keys 的绝对路径 (回车跳过):'
+            ask '服务器上的公钥文件绝对路径(回车跳过): '
             [[ -n $REPLY ]] || break
-            [[ $REPLY == /* ]] || { say '请输入绝对路径.'; continue; }
+            [[ $REPLY == /* ]] || { warn '路径格式无效, 请输入以 / 开头的绝对路径.'; continue; }
             import_public_keys "$REPLY"
             (( key_count == 0 )) || break
         done
     fi
-    say "检测到 $key_count 条可用的 SSH 授权公钥."
+    say "公钥检查完成: $key_count 条记录待导入."
 
     # 修改 root 登录策略前, 确认新用户至少有一种 SSH 登录方式.
     # 当前 SSH 客户端的地址可让 Match Address 的检查更接近实际登录.
@@ -212,12 +239,12 @@ PY
     then key_usable=1; fi
     if grep -qx 'passwordauthentication yes' "$temporary/user-ssh"; then password_usable=1; fi
     (( key_usable || password_usable )) \
-        || fail '新用户没有可用的 SSH 密钥或密码登录方式, 已停止以免锁在服务器外.'
+        || fail '未确认新用户具有可用的 SSH 公钥或密码登录方式, 已中止配置.'
     grep -qx 'authenticationmethods any' "$temporary/user-ssh" \
-        || fail 'SSH 设置了额外的多重认证要求, 请先手动处理.'
+        || fail 'SSH 配置包含额外认证要求, 请先检查 AuthenticationMethods 设置.'
 
     # Match 可以覆盖全局 PermitRootLogin; 扫描 Include, 拒绝显式重新开放 root 的规则.
-    python3 - "$sshd_config" <<'PY' || fail '发现可能覆盖 root 登录限制的 SSH 配置, 请先手动处理.'
+    python3 - "$sshd_config" <<'PY' || fail 'SSH 配置扫描未通过, 请检查 Include 文件及 Match 中的 PermitRootLogin 规则.'
 import glob, os, re, shlex, sys
 def scan(path, conditional=False, stack=()):
     real = os.path.realpath(path)
@@ -253,18 +280,19 @@ PY
     visudo -cf "$temporary/sudoers" >/dev/null
 
     # 执行确认:所有配置输入及预检查必须在此之前完成.
-    say '配置已填写完毕, 请核对:'
-    say "  新用户名: $username"
-    say "  家目录: /home/$username"
-    say '  登录密码: 已填写 (不显示明文)'
-    if (( passwordless )); then sudo_text=是; else sudo_text=否; fi
-    say "  sudo 免密: $sudo_text"
-    say "  待导入授权公钥: $key_count 条"
-    say '  root 登录: 在新用户登录验证成功后禁用密码及密钥登录, 并锁定 root 密码'
-    say '执行后还需在另一个终端验证新用户登录及 sudo, 再返回此处确认验证结果.'
-    ask_yes_no '是否按以上配置开始执行' || fail '已取消, 未修改用户及系统配置.'
+    stage '3/5 配置确认'
+    detail '用户名' "$username"
+    detail '家目录' "/home/$username"
+    detail '登录密码' '已填写, 不显示明文'
+    if (( passwordless )); then sudo_text=启用; else sudo_text=禁用; fi
+    detail 'sudo 免密' "$sudo_text"
+    detail '待导入公钥' "$key_count 条"
+    detail 'root 登录策略' '新用户验证通过后, 禁用 root SSH 登录并锁定 root 密码'
+    say '执行后需在独立终端验证新用户登录及 sudo 权限, 再返回本终端确认.'
+    ask_yes_no '确认以上配置并开始执行' || cancel '操作已取消, 未修改用户及系统配置.'
 
-    say '第二步:按确认的配置创建用户并设置权限.'
+    stage '4/5 应用配置'
+    say "正在创建用户 $username 并配置密码, SSH 公钥及 sudo 权限."
     useradd --create-home --user-group --home-dir "/home/$username" --shell /bin/bash "$username"
     user_created=1
     printf '%s:%s\n' "$username" "$password" | chpasswd
@@ -277,51 +305,57 @@ PY
     fi
     install -o root -g root -m 440 "$temporary/sudoers" "$sudo_file"
     sudo_created=1
-    visudo -c >/dev/null || fail 'sudo 配置验证失败.'
+    visudo -c >/dev/null || fail '写入后的 sudo 配置校验失败.'
     if (( passwordless )); then
-        sudo -u "$username" sudo -n /usr/bin/true || fail 'sudo 免密验证失败.'
+        sudo -u "$username" sudo -n /usr/bin/true || fail 'sudo 免密执行验证失败.'
     else
         if sudo -u "$username" sudo -n /usr/bin/true >/dev/null 2>&1; then
-            fail '其他 sudo 规则仍允许免密, 请先检查现有规则.'
+            fail '现有 sudo 规则仍允许免密执行, 与所选配置不符.请检查规则.'
         fi
     fi
 
-    say '第三步:验证新用户登录, 验证成功后执行 root 登录限制.'
-    say "新用户 $username 已配置好. 请保持此终端不关闭."
-    say "请在另一个终端运行 ssh $username@服务器地址, 并确认能登录及使用 sudo."
-    ask_yes_no '新终端是否已成功验证, 继续禁用 root 登录' \
-        || fail '已取消; 新建用户和 sudo 规则将回滚, root 登录保持原状.'
+    success "用户 $username 已配置完成, sudo 权限检查通过."
+    stage '5/5 登录验证与 root 访问限制'
+    say '请保持当前会话, 在独立终端登录新用户并验证 sudo 权限.'
+    detail '登录命令' "ssh $username@服务器地址"
+    ask_yes_no '是否已验证登录及 sudo 权限, 并继续禁用 root 登录' \
+        || cancel '验证未确认, 将回滚新建用户及 sudo 规则; root 登录配置未修改.'
+    say '正在应用 root 登录限制并重新加载 SSH 服务.'
 
     cp -a -- "$sshd_config" "$temporary/sshd_config"
     awk -F: '$1 == "root" { print $2 }' /etc/shadow > "$temporary/root-password"
-    [[ -s $temporary/root-password ]] || fail '无法保存当前 root 密码状态.'
+    [[ -s $temporary/root-password ]] || fail '无法备份 root 密码状态, 已中止配置.'
     { printf '# 由 ssh-user-bootstrap 设置: 禁止 root 使用密码及密钥登录\nPermitRootLogin no\n'; cat "$sshd_config"; } \
         > "$temporary/sshd-next"
-    "$sshd" -t -f "$temporary/sshd-next" || fail '新 SSH 配置验证失败.'
+    "$sshd" -t -f "$temporary/sshd-next" || fail '待应用的 SSH 配置校验失败.'
     ssh_changed=1
     cat "$temporary/sshd-next" > "$sshd_config"
-    "$sshd" -t || fail '写入后的 SSH 配置验证失败.'
+    "$sshd" -t || fail '写入后的 SSH 配置校验失败.'
     "$sshd" -T -C "user=root,host=$client_address,addr=$client_address,laddr=$server_address,lport=$server_port" > "$temporary/root-ssh"
-    grep -qx 'permitrootlogin no' "$temporary/root-ssh" || fail 'root SSH 禁令未生效.'
+    grep -qx 'permitrootlogin no' "$temporary/root-ssh" || fail 'root SSH 登录限制未通过有效配置检查.'
     "$sshd" -T -C "$ssh_context" > "$temporary/user-ssh-after"
     if (( key_usable )); then
-        grep -qx 'pubkeyauthentication yes' "$temporary/user-ssh-after" || fail '新用户密钥认证意外失效.'
+        grep -qx 'pubkeyauthentication yes' "$temporary/user-ssh-after" || fail '配置变更后, 新用户的 SSH 公钥认证未保持启用.'
     fi
     if (( password_usable )); then
-        grep -qx 'passwordauthentication yes' "$temporary/user-ssh-after" || fail '新用户密码认证意外失效.'
+        grep -qx 'passwordauthentication yes' "$temporary/user-ssh-after" || fail '配置变更后, 新用户的 SSH 密码认证未保持启用.'
     fi
     systemctl reload "$ssh_service"
-    systemctl is-active --quiet "$ssh_service" || fail 'SSH 服务重新加载后未运行.'
-    passwd -l root >/dev/null || fail '锁定 root 密码失败.'
+    systemctl is-active --quiet "$ssh_service" || fail 'SSH 服务重新加载后未处于运行状态.'
+    passwd -l root >/dev/null || fail 'root 密码锁定操作失败.'
     root_locked=1
-    passwd -S root | awk '$2 ~ /^L/ { found=1 } END { exit !found }' || fail 'root 密码锁定验证失败.'
+    passwd -S root | awk '$2 ~ /^L/ { found=1 } END { exit !found }' || fail 'root 密码锁定状态验证失败.'
 
-    say "完成: 普通用户 $username 已创建, 并设置了密码."
-    if (( passwordless )); then sudo_text=是; else sudo_text=否; fi
-    say "已复制 $key_count 条 SSH 授权公钥; sudo 免密: $sudo_text."
-    say 'root 密码已锁定, root 的 SSH 密码和密钥登录均已禁用.'
-    say "请保留当前会话, 并在新终端验证: ssh $username@服务器地址"
-    if [[ -n $script_file ]]; then say '本地脚本文件将在退出时删除.'; fi
+    stage '执行结果'
+    success '用户初始化及 SSH 访问限制已完成.'
+    detail '用户名' "$username"
+    detail '已导入公钥' "$key_count 条"
+    detail 'sudo 免密' "$sudo_text"
+    detail 'root SSH 登录' '已禁用'
+    detail 'root 密码' '已锁定'
+    say '请保留当前会话, 并在独立终端再次确认登录正常.'
+    detail '登录命令' "ssh $username@服务器地址"
+    if [[ -n $script_file ]]; then say '退出时将自动删除本地脚本文件.'; fi
 }
 
 main "$@" </dev/null
