@@ -1,5 +1,8 @@
 #!/usr/bin/env bash
-# Linux + systemd + OpenSSH. Run with Bash, never with sh.
+# 适用于 Linux,systemd 和 OpenSSH；必须使用 Bash,不能使用 sh。
+# 把完整流程放进函数,让 Bash 先读完函数定义,再执行服务器配置。
+# 从管道运行时,不依赖磁盘上的源文件,也不会让子命令读取下载中的脚本。
+bootstrap_main() {
 set -Eeuo pipefail
 export PATH=/usr/sbin:/usr/bin:/sbin:/bin
 umask 077
@@ -7,14 +10,15 @@ umask 077
 die() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
 usage() {
     cat <<'EOF'
-Usage:
+用法：
   sudo bash ssh-user-bootstrap.sh prepare USER [AUTHORIZED_KEYS_FILE]
-  # Log in through SSH as USER, then run the printed finalize command.
+  curl -fsSL URL | sudo bash -s -- prepare USER [AUTHORIZED_KEYS_FILE]
+  # 使用新用户通过 SSH 登录后,执行脚本打印的 finalize 命令。
 
-Creates a NEW administrator with passwordless sudo and SSH public keys.
-Default sources: root's authorized_keys, then the invoking sudo user's.
-Private keys are never copied. Existing authorized_keys restrictions are kept.
-Finalization locks root's password and disables ALL new root SSH logins.
+创建一个使用 SSH 公钥登录,拥有免密码 sudo 权限的新管理员。
+默认先查找 root 的 authorized_keys,再查找调用 sudo 的原用户的公钥。
+仅复制授权公钥,并保留原有访问限制；不会复制私钥。
+第二阶段锁定 root 密码,禁止所有新的 root SSH 登录。
 EOF
 }
 [[ ${1:-} == --help || ${1:-} == -h ]] && { usage; exit 0; }
@@ -26,6 +30,7 @@ mode=$1 name=$2
 for cmd in sshd ssh-keygen useradd passwd getent sudo visudo python3 systemctl flock install chpasswd; do
     command -v "$cmd" >/dev/null || die "Missing dependency: $cmd"
 done
+# 防止两个初始化进程同时修改用户及 SSH 配置。
 exec 9>/run/ssh-user-bootstrap.lock
 flock -n 9 || die 'Another bootstrap operation is running.'
 config=/etc/ssh/sshd_config
@@ -49,6 +54,7 @@ committed=0
 cleanup() {
     local rc=$?
     trap - EXIT INT TERM
+    # 仅回滚第二阶段改动,保留已创建的用户及排查所需的状态。
     if (( ! committed && (config_changed || password_changed) )); then
         printf 'Finalization failed; restoring root access settings.\n' >&2
         if (( password_changed )); then
@@ -68,6 +74,7 @@ trap 'exit 130' INT
 trap 'exit 143' TERM
 
 effective() {
+    # 按当前连接来源检查生效配置,包含 Match 条件的影响。
     local who=$1 address=127.0.0.1 server=127.0.0.1 port=22 unused
     if [[ -n ${SSH_CONNECTION:-} ]]; then
         read -r address unused server port <<< "$SSH_CONNECTION"
@@ -89,6 +96,7 @@ PY
 }
 
 if [[ $mode == prepare ]]; then
+    # 第一阶段：检测授权公钥,创建新管理员,并保持 root 登录策略不变。
     getent passwd "$name" >/dev/null && die 'User already exists; refusing to overwrite an existing account.'
     [[ ! -e $state && ! -e $sudoers && ! -L $sudoers ]] || die 'Bootstrap state or sudo rule already exists.'
     [[ -d /etc/sudoers.d && ! -L /etc/sudoers.d ]] || die 'Expected /etc/sudoers.d.'
@@ -114,6 +122,7 @@ if [[ $mode == prepare ]]; then
             line=${line%$'\r'}
             [[ $line =~ ^[[:space:]]*(#|$) ]] && continue
             [[ $line != *'PRIVATE KEY'* ]] || die 'Private-key input detected; only use authorized_keys or a public-key file.'
+            # 逐条检查公钥格式,原样保留 from,command 等访问限制。
             printf '%s\n' "$line" > "$work/one-key"
             ssh-keygen -l -f "$work/one-key" >/dev/null 2>&1 \
                 || die "Malformed public-key entry in $source; fix it before continuing."
@@ -129,8 +138,15 @@ if [[ $mode == prepare ]]; then
     [[ ! -e $user_home && ! -L $user_home ]] || die 'Home path already exists.'
     check_user_config
     install -d -o root -g root -m 700 "$state"
-    # Keep a root-owned copy so the second phase has a stable path.
-    install -o root -g root -m 700 -- "${BASH_SOURCE[0]}" "$state/bootstrap.sh"
+    # 直接把当前函数定义写成独立脚本,供第二阶段离线执行。
+    # declare -f 不依赖源文件路径,因此文件运行和 curl 管道运行都适用。
+    # 状态目录仅 root 可访问,生成的脚本不需要再次从网络下载。
+    {
+        printf '#!/usr/bin/env bash\n# 自动生成的第二阶段入口,内容来自已载入的初始化函数。\n'
+        declare -f bootstrap_main
+        printf '\nbootstrap_main "$@" </dev/null\n'
+    } > "$state/bootstrap.sh"
+    chmod 700 "$state/bootstrap.sh"
     useradd --create-home --user-group --home-dir "$user_home" --shell /bin/bash "$name"
     passwd -l "$name" >/dev/null
     chmod 750 "$user_home"
@@ -161,6 +177,7 @@ EOF
     exit 0
 fi
 
+# 第二阶段：必须从新用户的 SSH 会话通过 sudo 执行。
 [[ $# == 2 ]] || die 'finalize does not accept a key-file argument.'
 [[ -f $state/prepared && ! -L $state ]] || die 'Run prepare first.'
 [[ ! -f $state/completed ]] || die 'Already completed; no changes made.'
@@ -171,9 +188,9 @@ sudo -u "$name" sudo -n /usr/bin/true || die 'New administrator cannot use passw
 user_home=$(getent passwd "$name" | cut -d: -f6)
 check_user_config
 
-# Follow Include directives and reject any conditional root-login override.
-# Global settings are overridden by the new first line; Match rules can override
-# globals, so checking only sshd -T for one address would not be sufficient.
+# 递归检查 Include 文件,拒绝可能重新允许 root 登录的条件设置。
+# 新增首行可以覆盖原全局值,但 Match 可以覆盖全局设置,
+# 因此只对一个来源地址执行 sshd -T 检查并不充分。
 python3 - "$config" <<'PY'
 import glob, os, re, shlex, sys
 def scan(path, conditional=False, stack=()):
@@ -201,11 +218,12 @@ def scan(path, conditional=False, stack=()):
 scan(sys.argv[1])
 PY
 
+# 先备份并检查候选配置,再修改,重载 SSH,最后锁定 root 密码。
 cp -a -- "$config" "$state/sshd_config.before"
 awk -F: '$1 == "root" { print $2 }' /etc/shadow > "$state/root-password.before"
 [[ -s $state/root-password.before ]] || die 'Cannot save root password state.'
 cp -a -- "$config" "$work/sshd_config.next"
-{ printf '# Managed by ssh-user-bootstrap\nPermitRootLogin no\n'; cat "$config"; } > "$work/sshd_config.next"
+{ printf '# 由 ssh-user-bootstrap 管理\nPermitRootLogin no\n'; cat "$config"; } > "$work/sshd_config.next"
 sshd -t -f "$work/sshd_config.next"
 config_changed=1
 cat "$work/sshd_config.next" > "$config"
@@ -223,3 +241,8 @@ committed=1
 printf 'DONE: root password is locked; all new root SSH logins are disabled.\n'
 printf 'Administrator: %s; protected backup: %s\n' "$name" "$state"
 printf 'Existing SSH sessions remain open. Keep the new administrator session until a second login succeeds.\n'
+}
+
+# 函数定义读取完毕后才开始执行；隔离标准输入,防止子命令吞掉管道内容。
+# 公钥文件,内嵌 Python 代码和连接信息均通过各自的重定向读取。
+bootstrap_main "$@" </dev/null
