@@ -85,6 +85,7 @@ main() {
     esac
 
     say '将创建普通用户, 设置密码和 sudo 权限, 然后禁止 root 密码及密钥登录.'
+    say '第一步:填写全部配置. 此阶段只检查环境和准备临时文件, 不修改用户或系统配置.'
     while :; do
         ask '请输入新用户名:'
         username=$REPLY
@@ -243,6 +244,27 @@ def scan(path, conditional=False, stack=()):
 scan(sys.argv[1])
 PY
 
+    # 先准备并验证 sudo 规则, 配置收集完毕后再统一执行.
+    if (( passwordless )); then
+        printf '%s ALL=(ALL:ALL) NOPASSWD: ALL\n' "$username" > "$temporary/sudoers"
+    else
+        printf '%s ALL=(ALL:ALL) ALL\n' "$username" > "$temporary/sudoers"
+    fi
+    visudo -cf "$temporary/sudoers" >/dev/null
+
+    # 执行确认:所有配置输入及预检查必须在此之前完成.
+    say '配置已填写完毕, 请核对:'
+    say "  新用户名: $username"
+    say "  家目录: /home/$username"
+    say '  登录密码: 已填写 (不显示明文)'
+    if (( passwordless )); then sudo_text=是; else sudo_text=否; fi
+    say "  sudo 免密: $sudo_text"
+    say "  待导入授权公钥: $key_count 条"
+    say '  root 登录: 在新用户登录验证成功后禁用密码及密钥登录, 并锁定 root 密码'
+    say '执行后还需在另一个终端验证新用户登录及 sudo, 再返回此处确认验证结果.'
+    ask_yes_no '是否按以上配置开始执行' || fail '已取消, 未修改用户及系统配置.'
+
+    say '第二步:按确认的配置创建用户并设置权限.'
     useradd --create-home --user-group --home-dir "/home/$username" --shell /bin/bash "$username"
     user_created=1
     printf '%s:%s\n' "$username" "$password" | chpasswd
@@ -253,12 +275,6 @@ PY
         install -o "$username" -g "$username" -m 600 "$temporary/keys" "/home/$username/.ssh/authorized_keys"
         if command -v restorecon >/dev/null; then restorecon -RF "/home/$username"; fi
     fi
-    if (( passwordless )); then
-        printf '%s ALL=(ALL:ALL) NOPASSWD: ALL\n' "$username" > "$temporary/sudoers"
-    else
-        printf '%s ALL=(ALL:ALL) ALL\n' "$username" > "$temporary/sudoers"
-    fi
-    visudo -cf "$temporary/sudoers" >/dev/null
     install -o root -g root -m 440 "$temporary/sudoers" "$sudo_file"
     sudo_created=1
     visudo -c >/dev/null || fail 'sudo 配置验证失败.'
@@ -270,6 +286,7 @@ PY
         fi
     fi
 
+    say '第三步:验证新用户登录, 验证成功后执行 root 登录限制.'
     say "新用户 $username 已配置好. 请保持此终端不关闭."
     say "请在另一个终端运行 ssh $username@服务器地址, 并确认能登录及使用 sudo."
     ask_yes_no '新终端是否已成功验证, 继续禁用 root 登录' \
