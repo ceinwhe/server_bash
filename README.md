@@ -5,4 +5,7 @@
 ```bash
 curl -fsSL https://raw.githubusercontent.com/ceinwhe/server_bash/refs/heads/main/ssh-user-bootstrap.sh | bash
 ```
-
+cn用户
+```bash
+curl -fsSL https://api.gitproxy.dev/raw.githubusercontent.com/ceinwhe/server_bash/refs/heads/main/ssh-user-bootstrap.sh | bash
+```
